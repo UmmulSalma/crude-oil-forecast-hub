@@ -26,10 +26,10 @@ def load_hybrid_artifacts():
     hybrid_meta = joblib.load("models/hybrid_meta.pkl")
     return bilstm_model, svr_model, scaler_features, scaler_target, hybrid_meta
 
-def predict_tide(last_5_values):
+def predict_tide(last_12_values):
     tide_model, tide_scaler, tide_meta = load_tide_artifacts()
 
-    arr = np.array(last_5_values, dtype=float).reshape(-1, 1)
+    arr = np.array(last_12_values, dtype=float).reshape(-1, 1)
     scaled = tide_scaler.transform(arr).flatten().reshape(1, tide_meta["LOOKBACK"])
 
     pred_scaled = tide_model.predict(scaled, verbose=0)
@@ -68,10 +68,10 @@ st.divider()
 
 if model_choice == "TiDe SVR":
     st.subheader("TiDe Forecast")
-    st.write("Enter the last 5 production values from oldest to newest.")
+    st.write("Enter the last 12 production values from oldest to newest.")
 
     default_tide = pd.DataFrame({
-        "Production": [0.0] * 5
+        "Production": [0.0] * 12
     })
 
     with st.form("tide_form"):
@@ -87,8 +87,8 @@ if model_choice == "TiDe SVR":
         try:
             values = tide_input["Production"].astype(float).tolist()
 
-            if len(values) != 5:
-                st.error("TiDe requires exactly 5 production values.")
+            if len(values) != 12:
+                st.error("TiDe requires exactly 12 production values.")
             else:
                 prediction = predict_tide(values)
                 st.success("Prediction complete.")
