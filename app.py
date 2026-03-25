@@ -12,25 +12,33 @@ st.set_page_config(
 
 @st.cache_resource
 def load_tide_artifacts():
-    tide_model = load_model("models/tide_model.keras", compile=False)
+    tide_model = load_model(
+        "models/tide_model.keras",
+        compile=False,
+        safe_mode=False
+    )
     tide_scaler = joblib.load("models/tide_scaler.pkl")
     tide_meta = joblib.load("models/tide_meta.pkl")
     return tide_model, tide_scaler, tide_meta
 
 @st.cache_resource
 def load_hybrid_artifacts():
-    bilstm_model = load_model("models/bilstm_model.keras", compile=False)
+    bilstm_model = load_model(
+        "models/bilstm_model.keras",
+        compile=False
+    )
     svr_model = joblib.load("models/svr_model.pkl")
     scaler_features = joblib.load("models/scaler_features.pkl")
     scaler_target = joblib.load("models/scaler_target.pkl")
     hybrid_meta = joblib.load("models/hybrid_meta.pkl")
     return bilstm_model, svr_model, scaler_features, scaler_target, hybrid_meta
 
-def predict_tide(last_12_values):
+def predict_tide(values):
     tide_model, tide_scaler, tide_meta = load_tide_artifacts()
+    lookback = tide_meta["LOOKBACK"]
 
-    arr = np.array(last_12_values, dtype=float).reshape(-1, 1)
-    scaled = tide_scaler.transform(arr).flatten().reshape(1, tide_meta["LOOKBACK"])
+    arr = np.array(values, dtype=float).reshape(-1, 1)
+    scaled = tide_scaler.transform(arr).flatten().reshape(1, lookback)
 
     pred_scaled = tide_model.predict(scaled, verbose=0)
     pred = tide_scaler.inverse_transform(pred_scaled.reshape(-1, 1))
@@ -55,23 +63,27 @@ def predict_hybrid(input_df):
 
     return float(pred[0, 0])
 
+# Load TiDe metadata once so UI can adapt automatically
+_, _, tide_meta = load_tide_artifacts()
+tide_lookback = int(tide_meta["LOOKBACK"])
+
 st.title("🛢️ Crude Oil Forecast Hub")
 st.caption("Choose a forecasting model and enter recent values to predict the next production value.")
 
 model_choice = st.segmented_control(
     "Select forecasting model",
-    ["TiDe SVR", "Bi-LSTM + SVR Hybrid"],
+    ["TiDe + SVR", "Bi-LSTM + SVR Hybrid"],
     default="Bi-LSTM + SVR Hybrid"
 )
 
 st.divider()
 
-if model_choice == "TiDe SVR":
+if model_choice == "TiDe + SVR":
     st.subheader("TiDe Forecast")
-    st.write("Enter the last 12 production values from oldest to newest.")
+    st.write(f"Enter the last {tide_lookback} production values from oldest to newest.")
 
     default_tide = pd.DataFrame({
-        "Production": [0.0] * 12
+        "Production": [0.0] * tide_lookback
     })
 
     with st.form("tide_form"):
@@ -87,8 +99,8 @@ if model_choice == "TiDe SVR":
         try:
             values = tide_input["Production"].astype(float).tolist()
 
-            if len(values) != 12:
-                st.error("TiDe requires exactly 12 production values.")
+            if len(values) != tide_lookback:
+                st.error(f"TiDe requires exactly {tide_lookback} production values.")
             else:
                 prediction = predict_tide(values)
                 st.success("Prediction complete.")
