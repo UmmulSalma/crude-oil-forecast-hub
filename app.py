@@ -2,7 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import keras
 from tensorflow.keras.models import load_model
+
+# Enable loading of trusted Keras models that contain Lambda layers
+keras.config.enable_unsafe_deserialization()
 
 st.set_page_config(
     page_title="Crude Oil Forecast Hub",
@@ -25,7 +29,8 @@ def load_tide_artifacts():
 def load_hybrid_artifacts():
     bilstm_model = load_model(
         "models/bilstm_model.keras",
-        compile=False
+        compile=False,
+        safe_mode=False
     )
     svr_model = joblib.load("models/svr_model.pkl")
     scaler_features = joblib.load("models/scaler_features.pkl")
@@ -35,7 +40,7 @@ def load_hybrid_artifacts():
 
 def predict_tide(values):
     tide_model, tide_scaler, tide_meta = load_tide_artifacts()
-    lookback = tide_meta["LOOKBACK"]
+    lookback = int(tide_meta["LOOKBACK"])
 
     arr = np.array(values, dtype=float).reshape(-1, 1)
     scaled = tide_scaler.transform(arr).flatten().reshape(1, lookback)
@@ -48,7 +53,7 @@ def predict_hybrid(input_df):
     bilstm_model, svr_model, scaler_features, scaler_target, hybrid_meta = load_hybrid_artifacts()
 
     feature_columns = hybrid_meta["feature_columns"]
-    time_steps = hybrid_meta["TIME_STEPS"]
+    time_steps = int(hybrid_meta["TIME_STEPS"])
 
     df_input = input_df[feature_columns].copy()
     scaled_features = scaler_features.transform(df_input.values)
@@ -63,7 +68,7 @@ def predict_hybrid(input_df):
 
     return float(pred[0, 0])
 
-# Load TiDe metadata once so UI can adapt automatically
+# Load metadata so UI adapts automatically
 _, _, tide_meta = load_tide_artifacts()
 tide_lookback = int(tide_meta["LOOKBACK"])
 
@@ -72,13 +77,13 @@ st.caption("Choose a forecasting model and enter recent values to predict the ne
 
 model_choice = st.segmented_control(
     "Select forecasting model",
-    ["TiDe + SVR", "Bi-LSTM + SVR Hybrid"],
+    ["TiDe", "Bi-LSTM + SVR Hybrid"],
     default="Bi-LSTM + SVR Hybrid"
 )
 
 st.divider()
 
-if model_choice == "TiDe + SVR":
+if model_choice == "TiDe":
     st.subheader("TiDe Forecast")
     st.write(f"Enter the last {tide_lookback} production values from oldest to newest.")
 
