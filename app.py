@@ -5,7 +5,10 @@ import joblib
 import keras
 from tensorflow.keras.models import load_model
 
-# Enable loading of trusted Keras models that contain Lambda layers
+from darts import TimeSeries
+from darts.models import TiDEModel
+
+# Needed because your Bi-LSTM .keras model may contain Lambda layers
 keras.config.enable_unsafe_deserialization()
 
 st.set_page_config(
@@ -14,16 +17,26 @@ st.set_page_config(
     layout="wide"
 )
 
+# -----------------------------
+# MODEL SETTINGS
+# -----------------------------
+TIDE_MIN_ROWS = 8
+HYBRID_MIN_ROWS = 3
+TIDE_COV_COLS = ["Lag1", "Lag2", "oil price"]
+ALL_COLS = ["Production", "Lag1", "Lag2", "oil price"]
+
+
+# -----------------------------
+# LOADERS
+# -----------------------------
 @st.cache_resource
-def load_tide_artifacts():
-    tide_model = load_model(
-        "models/tide_model.keras",
-        compile=False,
-        safe_mode=False
-    )
-    tide_scaler = joblib.load("models/tide_scaler.pkl")
-    tide_meta = joblib.load("models/tide_meta.pkl")
-    return tide_model, tide_scaler, tide_meta
+def load_tide_svr_artifacts():
+    tide_model = TiDEModel.load("models/tide_final.pt", map_location="cpu")
+    svr_model = joblib.load("models/tide_svr_corrector.pkl")
+    target_scaler = joblib.load("models/tide_target_scaler.pkl")
+    cov_scaler = joblib.load("models/tide_cov_scaler.pkl")
+    return tide_model, svr_model, target_scaler, cov_scaler
+
 
 @st.cache_resource
 def load_hybrid_artifacts():
@@ -38,18 +51,64 @@ def load_hybrid_artifacts():
     hybrid_meta = joblib.load("models/hybrid_meta.pkl")
     return bilstm_model, svr_model, scaler_features, scaler_target, hybrid_meta
 
-def predict_tide(values):
-    tide_model, tide_scaler, tide_meta = load_tide_artifacts()
-    lookback = int(tide_meta["LOOKBACK"])
 
-    arr = np.array(values, dtype=float).reshape(-1, 1)
-    scaled = tide_scaler.transform(arr).flatten().reshape(1, lookback)
+# -----------------------------
+# HELPERS
+# -----------------------------
+def build_tide_history_series(history_df: pd.DataFrame):
+    time_index = pd.date_range("2000-01-01", periods=len(history_df), freq="MS")
 
-    pred_scaled = tide_model.predict(scaled, verbose=0)
-    pred = tide_scaler.inverse_transform(pred_scaled.reshape(-1, 1))
-    return float(pred[0, 0])
+    target_series = TimeSeries.from_times_and_values(
+        times=time_index,
+        values=history_df["Production"].astype(float).to_numpy(),
+        columns=["Production"]
+    )
 
-def predict_hybrid(input_df):
+    cov_series = TimeSeries.from_times_and_values(
+        times=time_index,
+        values=history_df[TIDE_COV_COLS].astype(float).to_numpy(),
+        columns=TIDE_COV_COLS
+    )
+
+    return target_series, cov_series
+
+
+def predict_tide_svr(history_df: pd.DataFrame, next_oil_price: float):
+    tide_model, svr_model, target_scaler, cov_scaler = load_tide_svr_artifacts()
+
+    target_series, cov_series = build_tide_history_series(history_df)
+
+    target_scaled = target_scaler.transform(target_series)
+    cov_scaled = cov_scaler.transform(cov_series)
+
+    # Base TiDE forecast
+    tide_pred_scaled = tide_model.predict(
+        n=1,
+        series=target_scaled,
+        past_covariates=cov_scaled
+    )
+
+    tide_pred_series = target_scaler.inverse_transform(tide_pred_scaled)
+    tide_pred_value = float(tide_pred_series.values().flatten()[0])
+
+    # Next-step features for SVR correction
+    next_lag1 = float(history_df["Production"].iloc[-1])
+    next_lag2 = float(history_df["Production"].iloc[-2])
+
+    svr_features = np.array([[
+        next_lag1,
+        next_lag2,
+        float(next_oil_price),
+        tide_pred_value
+    ]])
+
+    correction = float(svr_model.predict(svr_features)[0])
+    final_pred = tide_pred_value + correction
+
+    return tide_pred_value, correction, final_pred
+
+
+def predict_bilstm_hybrid(input_df: pd.DataFrame):
     bilstm_model, svr_model, scaler_features, scaler_target, hybrid_meta = load_hybrid_artifacts()
 
     feature_columns = hybrid_meta["feature_columns"]
@@ -68,86 +127,181 @@ def predict_hybrid(input_df):
 
     return float(pred[0, 0])
 
-# Load metadata so UI adapts automatically
-_, _, tide_meta = load_tide_artifacts()
-tide_lookback = int(tide_meta["LOOKBACK"])
 
+# -----------------------------
+# UI
+# -----------------------------
 st.title("🛢️ Crude Oil Forecast Hub")
-st.caption("Choose a forecasting model and enter recent values to predict the next production value.")
+st.caption("Choose a model and enter recent values to predict the next production value.")
 
 model_choice = st.segmented_control(
     "Select forecasting model",
-    ["TiDe", "Bi-LSTM + SVR Hybrid"],
-    default="Bi-LSTM + SVR Hybrid"
+    ["TiDE + SVR", "Bi-LSTM + SVR Hybrid"],
+    default="TiDE + SVR"
 )
 
 st.divider()
 
-if model_choice == "TiDe":
-    st.subheader("TiDe Forecast")
-    st.write(f"Enter the last {tide_lookback} production values from oldest to newest.")
+if model_choice == "TiDE + SVR":
+    st.subheader("TiDE + SVR Forecast")
+    st.write(
+        "You must enter at least 8 rows. You can add more if you want. "
+        "The model will use the most recent 8 rows."
+    )
 
-    default_tide = pd.DataFrame({
-        "Production": [0.0] * tide_lookback
-    })
+    tide_row_count = st.number_input(
+        "How many rows do you want to enter?",
+        min_value=TIDE_MIN_ROWS,
+        value=TIDE_MIN_ROWS,
+        step=1,
+        key="tide_row_count"
+    )
 
-    with st.form("tide_form"):
-        tide_input = st.data_editor(
-            default_tide,
-            hide_index=True,
-            num_rows="fixed",
-            use_container_width=True
+    with st.form("tide_svr_form"):
+        tide_rows = []
+
+        for i in range(int(tide_row_count)):
+            st.markdown(f"**Row {i + 1}**")
+            c1, c2, c3, c4 = st.columns(4)
+
+            production = c1.number_input(
+                f"Production {i + 1}",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                key=f"tide_prod_{i}"
+            )
+            lag1 = c2.number_input(
+                f"Lag1 {i + 1}",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                key=f"tide_lag1_{i}"
+            )
+            lag2 = c3.number_input(
+                f"Lag2 {i + 1}",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                key=f"tide_lag2_{i}"
+            )
+            oil_price = c4.number_input(
+                f"Oil price {i + 1}",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                key=f"tide_oil_{i}"
+            )
+
+            tide_rows.append([production, lag1, lag2, oil_price])
+
+        next_oil_price = st.number_input(
+            "Expected next oil price",
+            min_value=0.0,
+            value=0.0,
+            step=0.01,
+            key="next_oil_price"
         )
+
         submit_tide = st.form_submit_button("Predict next production")
 
     if submit_tide:
         try:
-            values = tide_input["Production"].astype(float).tolist()
+            tide_input = pd.DataFrame(tide_rows, columns=ALL_COLS)
 
-            if len(values) != tide_lookback:
-                st.error(f"TiDe requires exactly {tide_lookback} production values.")
-            else:
-                prediction = predict_tide(values)
-                st.success("Prediction complete.")
-                st.metric("Next predicted production", f"{prediction:,.4f}")
+            for col in ALL_COLS:
+                tide_input[col] = tide_input[col].astype(float)
+
+            # Use only the most recent 8 rows
+            tide_input = tide_input.tail(TIDE_MIN_ROWS).reset_index(drop=True)
+
+            tide_base, svr_correction, final_prediction = predict_tide_svr(
+                tide_input,
+                next_oil_price
+            )
+
+            st.success("Prediction complete.")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Base TiDE forecast", f"{tide_base:,.4f}")
+            c2.metric("SVR correction", f"{svr_correction:,.4f}")
+            c3.metric("Final TiDE + SVR forecast", f"{final_prediction:,.4f}")
+
         except Exception as e:
             st.error(f"Prediction failed: {e}")
 
 elif model_choice == "Bi-LSTM + SVR Hybrid":
     st.subheader("Bi-LSTM + SVR Hybrid Forecast")
-    st.write("Enter the last 3 rows in time order from oldest to newest.")
+    st.write(
+        "You must enter at least 3 rows. You can add more if you want. "
+        "The model will use the most recent 3 rows."
+    )
 
-    default_hybrid = pd.DataFrame({
-        "Production": [0.0, 0.0, 0.0],
-        "Lag1": [0.0, 0.0, 0.0],
-        "Lag2": [0.0, 0.0, 0.0],
-        "oil price": [0.0, 0.0, 0.0]
-    })
+    hybrid_row_count = st.number_input(
+        "How many rows do you want to enter?",
+        min_value=HYBRID_MIN_ROWS,
+        value=HYBRID_MIN_ROWS,
+        step=1,
+        key="hybrid_row_count"
+    )
 
     with st.form("hybrid_form"):
-        hybrid_input = st.data_editor(
-            default_hybrid,
-            hide_index=True,
-            num_rows="fixed",
-            use_container_width=True
-        )
+        hybrid_rows = []
+
+        for i in range(int(hybrid_row_count)):
+            st.markdown(f"**Row {i + 1}**")
+            c1, c2, c3, c4 = st.columns(4)
+
+            production = c1.number_input(
+                f"Production {i + 1}",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                key=f"hybrid_prod_{i}"
+            )
+            lag1 = c2.number_input(
+                f"Lag1 {i + 1}",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                key=f"hybrid_lag1_{i}"
+            )
+            lag2 = c3.number_input(
+                f"Lag2 {i + 1}",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                key=f"hybrid_lag2_{i}"
+            )
+            oil_price = c4.number_input(
+                f"Oil price {i + 1}",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                key=f"hybrid_oil_{i}"
+            )
+
+            hybrid_rows.append([production, lag1, lag2, oil_price])
+
         submit_hybrid = st.form_submit_button("Predict next production")
 
     if submit_hybrid:
         try:
-            required_cols = ["Production", "Lag1", "Lag2", "oil price"]
+            hybrid_input = pd.DataFrame(hybrid_rows, columns=ALL_COLS)
 
-            for col in required_cols:
+            for col in ALL_COLS:
                 hybrid_input[col] = hybrid_input[col].astype(float)
 
-            if hybrid_input.shape[0] != 3:
-                st.error("Hybrid model requires exactly 3 rows.")
-            else:
-                prediction = predict_hybrid(hybrid_input[required_cols])
-                st.success("Prediction complete.")
-                st.metric("Next predicted production", f"{prediction:,.4f}")
+            # Use only the most recent 3 rows
+            hybrid_input = hybrid_input.tail(HYBRID_MIN_ROWS).reset_index(drop=True)
+
+            prediction = predict_bilstm_hybrid(hybrid_input)
+
+            st.success("Prediction complete.")
+            st.metric("Next predicted production", f"{prediction:,.4f}")
+
         except Exception as e:
             st.error(f"Prediction failed: {e}")
 
 st.divider()
-st.info("Tip: enter values from oldest to newest.")
+st.info("Tip: enter rows from oldest to newest. If you enter extra rows, the app uses the most recent ones.")
